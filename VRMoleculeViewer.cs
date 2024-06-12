@@ -3,6 +3,7 @@ using UnityEngine.XR.Interaction.Toolkit;
 using VRC.SDKBase;
 using System.Collections.Generic;
 using System.IO;
+using Photon.Pun;
 
 public class VRMoleculeViewer : MonoBehaviour
 {
@@ -66,7 +67,7 @@ public class VRMoleculeViewer : MonoBehaviour
     // 現在の操作モード
     private enum Mode
     {
-        Create, Move, Rotate, Scale, Boolean, Paint
+        Create, Move, Rotate, Scale, Boolean, Paint, Edit
     }
     private Mode currentMode;
 
@@ -91,7 +92,14 @@ public class VRMoleculeViewer : MonoBehaviour
         public Vector3 position;
         public Quaternion rotation;
         public Vector3 scale;
+        public string actionType; // 操作の種類 (Create, Move, Rotate, Scale, Boolean, Paint)
+        public int? atomInstanceId; // 操作対象の原子 (原子移動の場合)
+        public Vector3? previousPosition; // 操作前の位置 (原子移動の場合)
+        public Material material; // 操作前の材質 (ペイントの場合)
     }
+
+    // Photon Network のインスタンス
+    private PhotonView photonView;
 
     void Start()
     {
@@ -115,6 +123,9 @@ public class VRMoleculeViewer : MonoBehaviour
 
         // モデル保存用ファイルパスの設定
         saveFilePath = Path.Combine(Application.persistentDataPath, "molecule.json");
+
+        // Photon Network の初期化
+        photonView = GetComponent<PhotonView>();
 
         // パーティクルシステムの設定
         particleSystem.maxParticles = 100; // パーティクル数の制限
@@ -178,6 +189,14 @@ public class VRMoleculeViewer : MonoBehaviour
                     CreateParticle(interactor.transform.position, selectedMaterial.color);
                 }
                 break;
+
+            case Mode.Edit:
+                // 原子移動
+                if (selectedAtom != null && interactor.isSelectActive)
+                {
+                    MoveAtom(interactor.transform.position);
+                }
+                break;
         }
 
         // UNDO/REDO処理
@@ -220,6 +239,10 @@ public class VRMoleculeViewer : MonoBehaviour
             case "Paint":
                 currentMode = Mode.Paint;
                 break;
+
+            case "Edit":
+                currentMode = Mode.Edit;
+                break;
         }
     }
 
@@ -256,12 +279,24 @@ public class VRMoleculeViewer : MonoBehaviour
                 booleanTargetObject = args.interactable.gameObject;
             }
         }
+        else if (currentMode == Mode.Edit)
+        {
+            if (args.interactable.gameObject.CompareTag("Atom"))
+            {
+                selectedAtom = args.interactable.gameObject;
+                DisplayAtomInfo(selectedAtom);
+            }
+        }
     }
 
     // オブジェクト選択解除
     private void OnSelectExit(SelectExitEventArgs args)
     {
-        // ...
+        if (selectedAtom != null)
+        {
+            selectedAtom = null;
+            HideAtomInfo();
+        }
     }
 
     // プリミティブ作成
@@ -284,7 +319,7 @@ public class VRMoleculeViewer : MonoBehaviour
 
         creatingObject.transform.position = position;
         objectList.Add(creatingObject);
-        undoStack.Push(new UndoData { targetObject = creatingObject, position = position, rotation = creatingObject.transform.rotation, scale = creatingObject.transform.localScale });
+        undoStack.Push(new UndoData { targetObject = creatingObject, position = position, rotation = creatingObject.transform.rotation, scale = creatingObject.transform.localScale, actionType = "Create" });
     }
 
     // ブーリアン演算
@@ -319,7 +354,7 @@ public class VRMoleculeViewer : MonoBehaviour
         Destroy(booleanTargetObject);
 
         // UNDO 履歴に情報を追加
-        undoStack.Push(new UndoData { targetObject = selectedObject, position = selectedObject.transform.position, rotation = selectedObject.transform.rotation, scale = selectedObject.transform.localScale });
+        undoStack.Push(new UndoData { targetObject = selectedObject, position = selectedObject.transform.position, rotation = selectedObject.transform.rotation, scale = selectedObject.transform.localScale, actionType = "Boolean" });
     }
 
     // オブジェクト移動
@@ -327,7 +362,7 @@ public class VRMoleculeViewer : MonoBehaviour
     {
         if (selectedObject != null)
         {
-            undoStack.Push(new UndoData { targetObject = selectedObject, position = selectedObject.transform.position, rotation = selectedObject.transform.rotation, scale = selectedObject.transform.localScale });
+            undoStack.Push(new UndoData { targetObject = selectedObject, position = selectedObject.transform.position, rotation = selectedObject.transform.rotation, scale = selectedObject.transform.localScale, actionType = "Move" });
             selectedObject.transform.position = position;
             redoStack.Clear();
         }
@@ -338,7 +373,7 @@ public class VRMoleculeViewer : MonoBehaviour
     {
         if (selectedObject != null)
         {
-            undoStack.Push(new UndoData { targetObject = selectedObject, position = selectedObject.transform.position, rotation = selectedObject.transform.rotation, scale = selectedObject.transform.localScale });
+            undoStack.Push(new UndoData { targetObject = selectedObject, position = selectedObject.transform.position, rotation = selectedObject.transform.rotation, scale = selectedObject.transform.localScale, actionType = "Rotate" });
             selectedObject.transform.rotation = rotation;
             redoStack.Clear();
         }
@@ -349,9 +384,29 @@ public class VRMoleculeViewer : MonoBehaviour
     {
         if (selectedObject != null)
         {
-            undoStack.Push(new UndoData { targetObject = selectedObject, position = selectedObject.transform.position, rotation = selectedObject.transform.rotation, scale = selectedObject.transform.localScale });
+            undoStack.Push(new UndoData { targetObject = selectedObject, position = selectedObject.transform.position, rotation = selectedObject.transform.rotation, scale = selectedObject.transform.localScale, actionType = "Scale" });
             selectedObject.transform.localScale = scale;
             redoStack.Clear();
+        }
+    }
+
+    // 原子移動処理
+    private void MoveAtom(Vector3 position)
+    {
+        if (selectedAtom != null)
+        {
+            // 原子の位置を更新
+            selectedAtom.transform.position = position;
+
+            // 原子のデータも更新
+            AtomData atomData = selectedAtom.GetComponent<AtomData>();
+            atomData.position = position;
+
+            // ネットワークで同期
+            photonView.RPC("SyncAtomPosition", RpcTarget.AllBuffered, selectedAtom.GetInstanceID(), position);
+
+            // UNDO 履歴に情報を追加
+            undoStack.Push(new UndoData { targetObject = selectedAtom, position = position, rotation = selectedAtom.transform.rotation, scale = selectedAtom.transform.localScale, actionType = "Edit", atomInstanceId = selectedAtom.GetInstanceID(), previousPosition = selectedAtom.transform.position });
         }
     }
 
@@ -361,9 +416,49 @@ public class VRMoleculeViewer : MonoBehaviour
         if (undoStack.Count > 0)
         {
             UndoData undoData = undoStack.Pop();
-            undoData.targetObject.transform.position = undoData.position;
-            undoData.targetObject.transform.rotation = undoData.rotation;
-            undoData.targetObject.transform.localScale = undoData.scale;
+            switch (undoData.actionType)
+            {
+                case "Create":
+                    Destroy(undoData.targetObject);
+                    break;
+
+                case "Move":
+                case "Rotate":
+                case "Scale":
+                    undoData.targetObject.transform.position = undoData.position;
+                    undoData.targetObject.transform.rotation = undoData.rotation;
+                    undoData.targetObject.transform.localScale = undoData.scale;
+                    break;
+
+                case "Boolean":
+                    // ブーリアン演算のUNDOは複雑なので、ここでは省略します
+                    break;
+
+                case "Edit":
+                    // 原子移動のUNDO
+                    if (undoData.atomInstanceId.HasValue)
+                    {
+                        GameObject atomObject = GameObject.Find(undoData.atomInstanceId.Value.ToString());
+                        if (atomObject != null && undoData.previousPosition.HasValue)
+                        {
+                            atomObject.transform.position = undoData.previousPosition.Value;
+                            AtomData atomData = atomObject.GetComponent<AtomData>();
+                            atomData.position = undoData.previousPosition.Value;
+                            photonView.RPC("SyncAtomPosition", RpcTarget.AllBuffered, undoData.atomInstanceId.Value, undoData.previousPosition.Value);
+                        }
+                    }
+                    break;
+
+                case "Paint":
+                    // ペイントのUNDO
+                    if (undoData.targetObject != null && undoData.material != null)
+                    {
+                        undoData.targetObject.GetComponent<Renderer>().material = undoData.material;
+                    }
+                    break;
+            }
+
+            // REDO履歴に追加
             redoStack.Push(undoData);
         }
     }
@@ -374,9 +469,50 @@ public class VRMoleculeViewer : MonoBehaviour
         if (redoStack.Count > 0)
         {
             UndoData redoData = redoStack.Pop();
-            redoData.targetObject.transform.position = redoData.position;
-            redoData.targetObject.transform.rotation = redoData.rotation;
-            redoData.targetObject.transform.localScale = redoData.scale;
+            switch (redoData.actionType)
+            {
+                case "Create":
+                    // UNDOでは削除したので、ここで作成処理を再度実行
+                    CreatePrimitive(redoData.position);
+                    break;
+
+                case "Move":
+                case "Rotate":
+                case "Scale":
+                    redoData.targetObject.transform.position = redoData.position;
+                    redoData.targetObject.transform.rotation = redoData.rotation;
+                    redoData.targetObject.transform.localScale = redoData.scale;
+                    break;
+
+                case "Boolean":
+                    // ブーリアン演算のREDOは複雑なので、ここでは省略します
+                    break;
+
+                case "Edit":
+                    // 原子移動のREDO
+                    if (redoData.atomInstanceId.HasValue)
+                    {
+                        GameObject atomObject = GameObject.Find(redoData.atomInstanceId.Value.ToString());
+                        if (atomObject != null)
+                        {
+                            atomObject.transform.position = redoData.position;
+                            AtomData atomData = atomObject.GetComponent<AtomData>();
+                            atomData.position = redoData.position;
+                            photonView.RPC("SyncAtomPosition", RpcTarget.AllBuffered, redoData.atomInstanceId.Value, redoData.position);
+                        }
+                    }
+                    break;
+
+                case "Paint":
+                    // ペイントのREDO
+                    if (redoData.targetObject != null && redoData.material != null)
+                    {
+                        redoData.targetObject.GetComponent<Renderer>().material = redoData.material;
+                    }
+                    break;
+            }
+
+            // UNDO履歴に追加
             undoStack.Push(redoData);
         }
     }
@@ -394,7 +530,40 @@ public class VRMoleculeViewer : MonoBehaviour
     private void OnParticleCollision(GameObject other)
     {
         // 衝突したオブジェクトに色を適用
-        other.GetComponent<Renderer>().material = selectedMaterial;
+        if (other.CompareTag("Atom"))
+        {
+            // 原子に色を適用
+            Material previousMaterial = other.GetComponent<Renderer>().material;
+            other.GetComponent<Renderer>().material = selectedMaterial;
+
+            // UNDO 用に、元の材質を保存
+            undoStack.Push(new UndoData { targetObject = other, material = previousMaterial, actionType = "Paint" });
+        }
+    }
+
+    // ネットワーク同期: 分子データ
+    [PunRPC]
+    private void SyncMoleculeData(List<AtomData> atomData, List<BondData> bondData)
+    {
+        atomDataList = atomData;
+        bondDataList = bondData;
+        CreateMoleculeModel();
+    }
+
+    // ネットワーク同期: 原子位置
+    [PunRPC]
+    private void SyncAtomPosition(int atomInstanceId, Vector3 position)
+    {
+        // インスタンス ID から原子オブジェクトを取得
+        GameObject atomObject = GameObject.Find(atomInstanceId.ToString());
+
+        // 原子の位置を更新
+        if (atomObject != null)
+        {
+            atomObject.transform.position = position;
+            AtomData atomData = atomObject.GetComponent<AtomData>();
+            atomData.position = position;
+        }
     }
 
     // モデル保存機能
